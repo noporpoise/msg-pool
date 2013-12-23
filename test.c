@@ -6,13 +6,13 @@
 
 // Queue
 MPMCQueue q;
-const int qlen = 10000;
+const int qlen = 1000;
 
 // 100 producers, 100 consumers, each producer produces 10000
 const int nproducers = 10, nconsumers = 10, proc_count = 100000;
 
 pthread_t prod_threads[nproducers], cons_threads[nconsumers];
-int prod_ids[nproducers], cons_ids[nproducers];
+int prod_ids[nproducers], cons_ids[nconsumers];
 
 void seed_random()
 {
@@ -47,14 +47,9 @@ void* consumer(void *ptr)
   pthread_exit(NULL);
 }
 
-int main()
+void init_threads()
 {
   int i, rc;
-
-  // Create queue of ints of length qlen 
-  // mpmc_alloc(&q, qlen, sizeof(int));
-  mpmc_alloc(&q, qlen, sizeof(int), nproducers, nconsumers);
-
   pthread_attr_t thread_attr;
   pthread_attr_init(&thread_attr);
   pthread_attr_setdetachstate(&thread_attr, PTHREAD_CREATE_JOINABLE);
@@ -96,9 +91,18 @@ int main()
     if(rc != 0) { fprintf(stderr, "Join thread failed\n"); exit(-1); }
   }
 
+  pthread_attr_destroy(&thread_attr);
+}
+
+int main()
+{
+  // Create queue of ints of length qlen
+  mpmc_alloc(&q, qlen, sizeof(int), nproducers, nconsumers);
+
+  init_threads();
+
   printf("done.\n");
   mpmc_dealloc(&q);
-  pthread_attr_destroy(&thread_attr);
 
   return EXIT_SUCCESS;
 }

@@ -5,12 +5,15 @@ else
 	CFLAGS = -O2
 endif
 
-test: test.c mpmc.h
-	$(CC) -Wall -Wextra $(CFLAGS) -o test test.c -lpthread
+all: test
 
 clean:
-	rm -rf test test.dSYM
+	rm -rf test test.dSYM ptest
 
-all: test
+test: test.c mpmc.h
+	$(CC) -Wall -Wextra -std=c99 $(CFLAGS) -o test test.c -lpthread
+
+# ptest: ptest.c pipe/pipe.o
+# 	$(CC) -Wall -Wextra -std=c99 $(CFLAGS) -o ptest -I pipe/ ptest.c pipe/pipe.o
 
 .PHONY: all clean

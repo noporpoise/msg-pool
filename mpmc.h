@@ -14,7 +14,7 @@
 #define MPMC_FULL 3
 
 // TODO:
-// * memory barrier on writes
+// * check memory barrier on writes
 
 typedef struct
 {
@@ -105,9 +105,6 @@ static inline int mpmc_read(MPMCQueue *q, void *p)
           pthread_mutex_unlock(&q->read_wait_mutex);
         }
 
-        // printf("q->noccupied: %zu [%s] sleeping_prods: %i\n",
-        //        q->noccupied, q->open ? "open" : "closed", q->sleeping_prods);
-
         return q->elsize;
       }
     }
@@ -155,18 +152,13 @@ static inline void mpmc_write(MPMCQueue *q, void *p)
         nocc = __sync_fetch_and_add(&q->noccupied, 1); // q->noccupied++
         nocc++;
         // __sync_synchronize();
-        // printf("WROTE [left: %zu]\n", q->noccupied);
 
-        // if(q->noccupied == q->nel) printf("Queue full\n");
-
-        // if occupied >= waiting threads
-        // => q->noccupied >= q->nconsumers-q->sleeping_cons
         size_t nconsumers = q->nconsumers - q->sleeping_cons;
-        if(q->sleeping_cons && nconsumers < nocc)
+        if(q->sleeping_cons && (nconsumers == 0 || nconsumers < nocc))
         {
           // Notify when element written
           pthread_mutex_lock(&q->write_wait_mutex);
-          pthread_cond_signal(&q->write_wait_cond); // wake one
+          pthread_cond_signal(&q->write_wait_cond); // wake reading thread
           pthread_mutex_unlock(&q->write_wait_mutex);
         }
 
