@@ -15,11 +15,12 @@
 
 // TODO:
 // * memory barrier on writes
-// * wait on write
 
 typedef struct
 {
-  const size_t nel, elsize, qsize, qend; // qsize = elsize+1, qend=(qsize)*nel
+  // qsize = elsize+1, qend=(qsize)*nel
+  const size_t nel, elsize, qsize, qend;
+  size_t nproducers, nconsumers;
   volatile size_t noccupied, last_read, last_write;
   volatile char *const data; // [<state><element>]+
 
@@ -29,27 +30,29 @@ typedef struct
 
   // Mutexes for waiting
   // number of write threads waiting for read, and vice versa
-  volatile size_t notify_read, notify_write;
+  volatile size_t sleeping_prods, sleeping_cons;
   pthread_mutex_t read_wait_mutex, write_wait_mutex;
   pthread_cond_t read_wait_cond, write_wait_cond;
 } MPMCQueue;
 
 // Allocate a new queue
-static inline void mpmc_alloc(MPMCQueue *q, size_t nel, size_t elsize)
+static inline void mpmc_alloc(MPMCQueue *q, size_t nel, size_t elsize,
+                              size_t nproducers, size_t nconsumers)
 {
   char *data = calloc(nel, elsize+1);
   MPMCQueue tmpq = {.nel = nel, .elsize = elsize, .qsize = elsize+1,
                     .qend = (elsize+1)*nel, .data = data,
+                    .nproducers = nproducers, .nconsumers = nconsumers,
                     .noccupied = 0, .open = 1,
                     .last_read = 0, .last_write = 0,
-                    .notify_read = 0, .notify_write = 0};
+                    .sleeping_prods = 0, .sleeping_cons = 0};
   memcpy(q, &tmpq, sizeof(MPMCQueue));
   if(pthread_mutex_init(&q->read_wait_mutex, NULL) != 0 ||
      pthread_mutex_init(&q->write_wait_mutex, NULL) != 0)
-  { fprintf(stderr, "pthread_mutex init failed\n"); kill(getpid(), SIGABRT);}
+  { fprintf(stderr, "pthread_mutex init failed\n"); abort(); }
   if(pthread_cond_init(&q->read_wait_cond, NULL) != 0 ||
     pthread_cond_init(&q->write_wait_cond, NULL) != 0)
-  { fprintf(stderr, "pthread_cond init failed\n"); kill(getpid(), SIGABRT);}
+  { fprintf(stderr, "pthread_cond init failed\n"); abort(); }
 }
 
 // Deallocate a new queue
@@ -63,7 +66,7 @@ static inline void mpmc_dealloc(MPMCQueue *q)
 // Returns number of bytes read (0 or q->nel)
 static inline int mpmc_read(MPMCQueue *q, void *p)
 {
-  size_t i, s = q->last_read;
+  size_t i, nocc, s = q->last_read;
   while(1)
   {
     if(q->noccupied == 0) {
@@ -71,10 +74,10 @@ static inline int mpmc_read(MPMCQueue *q, void *p)
       else {
         // Wait on write
         pthread_mutex_lock(&q->write_wait_mutex);
-        __sync_fetch_and_add(&q->notify_write, 1); // atomic q->notify_write++
-        while(q->noccupied == 0)
+        __sync_fetch_and_add(&q->sleeping_cons, 1); // atomic q->sleeping_cons++
+        while(q->noccupied == 0 && q->open)
           pthread_cond_wait(&q->write_wait_cond, &q->write_wait_mutex);
-        __sync_fetch_and_sub(&q->notify_write, 1); // atomic q->notify_write--
+        __sync_fetch_and_sub(&q->sleeping_cons, 1); // atomic q->sleeping_cons--
         pthread_mutex_unlock(&q->write_wait_mutex);
       }
     }
@@ -89,18 +92,21 @@ static inline int mpmc_read(MPMCQueue *q, void *p)
         __sync_synchronize();
         q->data[i] = MPMC_EMPTY;
         // __sync_synchronize();
-        __sync_fetch_and_sub(&q->noccupied, 1); // q->noccupied--
+        nocc = __sync_fetch_and_sub(&q->noccupied, 1); // q->noccupied--
+        nocc--;
         // __sync_synchronize();
 
-        if(q->notify_read && (q->noccupied == 0 || q->noccupied == q->nel-1)) {
+        size_t nproducers = q->nproducers-q->sleeping_prods;
+        if(q->sleeping_prods && nproducers < q->nel-nocc)
+        {
           // Notify when space appears in queue or queue empty
           pthread_mutex_lock(&q->read_wait_mutex);
           pthread_cond_signal(&q->read_wait_cond); // wake one
           pthread_mutex_unlock(&q->read_wait_mutex);
         }
 
-        // printf("q->noccupied: %zu [%s] notify_read: %i\n",
-        //        q->noccupied, q->open ? "open" : "closed", q->notify_read);
+        // printf("q->noccupied: %zu [%s] sleeping_prods: %i\n",
+        //        q->noccupied, q->open ? "open" : "closed", q->sleeping_prods);
 
         return q->elsize;
       }
@@ -119,10 +125,10 @@ static inline void _mpmc_wait(MPMCQueue *q, char til_empty)
   size_t limit = til_empty ? 0 : q->nel - 1;
   if(q->noccupied > limit) {
     pthread_mutex_lock(&q->read_wait_mutex);
-    __sync_fetch_and_add(&q->notify_read, 1); // atomic q->notify_read++
+    __sync_fetch_and_add(&q->sleeping_prods, 1); // atomic q->sleeping_prods++
     while(q->noccupied > limit)
       pthread_cond_wait(&q->read_wait_cond, &q->read_wait_mutex);
-    __sync_fetch_and_sub(&q->notify_read, 1); // atomic q->notify_read--
+    __sync_fetch_and_sub(&q->sleeping_prods, 1); // atomic q->sleeping_prods--
     pthread_mutex_unlock(&q->read_wait_mutex);
   }
   // printf("done waiting %zu\n", q->noccupied);
@@ -130,7 +136,7 @@ static inline void _mpmc_wait(MPMCQueue *q, char til_empty)
 
 static inline void mpmc_write(MPMCQueue *q, void *p)
 {
-  size_t i, s = q->last_write;
+  size_t i, nocc, s = q->last_write;
   while(1)
   {
     while(q->noccupied == q->nel) _mpmc_wait(q, 0);
@@ -146,13 +152,18 @@ static inline void mpmc_write(MPMCQueue *q, void *p)
         // __sync_synchronize();
         q->data[i] = MPMC_FULL;
         // __sync_synchronize();
-        __sync_fetch_and_add(&q->noccupied, 1); // q->noccupied++
+        nocc = __sync_fetch_and_add(&q->noccupied, 1); // q->noccupied++
+        nocc++;
         // __sync_synchronize();
         // printf("WROTE [left: %zu]\n", q->noccupied);
 
         // if(q->noccupied == q->nel) printf("Queue full\n");
 
-        if(q->notify_write) {
+        // if occupied >= waiting threads
+        // => q->noccupied >= q->nconsumers-q->sleeping_cons
+        size_t nconsumers = q->nconsumers - q->sleeping_cons;
+        if(q->sleeping_cons && nconsumers < nocc)
+        {
           // Notify when element written
           pthread_mutex_lock(&q->write_wait_mutex);
           pthread_cond_signal(&q->write_wait_cond); // wake one
@@ -177,6 +188,11 @@ static inline void mpmc_wait_til_empty(MPMCQueue *q)
 // Close causes mpmc_read() to return 0 if queue is empty
 static inline void mpmc_close(MPMCQueue *q) {
   q->open = 0;
+  if(q->sleeping_cons) {
+    pthread_mutex_lock(&q->write_wait_mutex);
+    pthread_cond_broadcast(&q->write_wait_cond); // wake one
+    pthread_mutex_unlock(&q->write_wait_mutex);
+  }
 }
 
 static inline void mpmc_reopen(MPMCQueue *q) {

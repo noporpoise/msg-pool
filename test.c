@@ -52,8 +52,8 @@ int main()
   int i, rc;
 
   // Create queue of ints of length qlen 
-  mpmc_alloc(&q, qlen, sizeof(int));
-  // mpmc_alloc(&q, qlen, sizeof(int), nproducers, nconsumers);
+  // mpmc_alloc(&q, qlen, sizeof(int));
+  mpmc_alloc(&q, qlen, sizeof(int), nproducers, nconsumers);
 
   pthread_attr_t thread_attr;
   pthread_attr_init(&thread_attr);
