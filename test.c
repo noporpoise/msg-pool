@@ -9,7 +9,7 @@ MPMCQueue q;
 const int qlen = 10000;
 
 // 100 producers, 100 consumers, each producer produces 10000
-const int nproducers = 10, nconsumers = 3, proc_count = 100000;
+const int nproducers = 10, nconsumers = 10, proc_count = 100000;
 
 pthread_t prod_threads[nproducers], cons_threads[nconsumers];
 int prod_ids[nproducers], cons_ids[nproducers];
@@ -52,7 +52,8 @@ int main()
   int i, rc;
 
   // Create queue of ints of length qlen 
-  mpmc_alloc(&q, qlen, sizeof(int), nproducers, nconsumers);
+  mpmc_alloc(&q, qlen, sizeof(int));
+  // mpmc_alloc(&q, qlen, sizeof(int), nproducers, nconsumers);
 
   pthread_attr_t thread_attr;
   pthread_attr_init(&thread_attr);
