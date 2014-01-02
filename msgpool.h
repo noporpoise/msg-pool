@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <unistd.h>  // need for getpid()
 #include <signal.h> // needed for kill
+#include <assert.h>
 
 #define MPOOL_EMPTY 0
 #define MPOOL_READING 1
@@ -49,6 +50,9 @@ static inline void msgpool_alloc(MsgPool *q, size_t nel, size_t elsize,
                     .sleeping_prods = 0, .sleeping_cons = 0};
   memcpy(q, &tmpq, sizeof(MsgPool));
 
+  assert(nconsumers < nel);
+  assert(nproducers < nel);
+
   if(pthread_mutex_init(&q->read_wait_mutex, NULL) != 0 ||
      pthread_mutex_init(&q->write_wait_mutex, NULL) != 0)
   {
@@ -71,12 +75,13 @@ static inline void msgpool_dealloc(MsgPool *q)
   free((char*)q->data);
 }
 
-// Initialise elements in an array
+// Iterate over elements in the pool
 // calls func(el,idx,args) with idx being 0,1,2... and el a pointer to the
 // element (beware: not aligned in memory)
-static inline void msgpool_init(MsgPool *q,
-                                void (*func)(char *el, size_t idx, void *args),
-                                void *args)
+// Can be used to initialise elements at the begining or clean up afterwards
+static inline void msgpool_iterate(MsgPool *q,
+                                   void (*func)(char *el, size_t idx, void *args),
+                                   void *args)
 {
   size_t i; char *ptr, *data = (char*)q->data;
   for(i = 0, ptr = data+1; i < q->nel; i++, ptr += q->qsize) {
@@ -125,11 +130,13 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
         // __sync_synchronize();
 
         size_t nproducers = q->nproducers-q->sleeping_prods;
-        if(q->sleeping_prods && nproducers < q->nel-nocc)
+        if(q->sleeping_prods &&
+           (nproducers < q->nel-nocc || nproducers == 0 || nocc == 0))
         {
           // Notify when space appears in pool or pool empty
           pthread_mutex_lock(&q->read_wait_mutex);
-          pthread_cond_signal(&q->read_wait_cond); // wake one
+          if(q->sleeping_prods)
+            pthread_cond_signal(&q->read_wait_cond); // wake one
           pthread_mutex_unlock(&q->read_wait_mutex);
         }
 
@@ -184,11 +191,13 @@ static inline void msgpool_write(MsgPool *q, const void *restrict p,
         // __sync_synchronize();
 
         size_t nconsumers = q->nconsumers - q->sleeping_cons;
-        if(q->sleeping_cons && (nconsumers == 0 || nconsumers < nocc))
+        if(q->sleeping_cons &&
+           (nconsumers < nocc || nconsumers == 0 || q->noccupied == q->nel))
         {
           // Notify when element written
           pthread_mutex_lock(&q->write_wait_mutex);
-          pthread_cond_signal(&q->write_wait_cond); // wake reading thread
+          if(q->sleeping_cons)
+            pthread_cond_signal(&q->write_wait_cond); // wake reading thread
           pthread_mutex_unlock(&q->write_wait_mutex);
         }
 
@@ -213,7 +222,8 @@ static inline void msgpool_close(MsgPool *q)
   q->open = 0;
   if(q->sleeping_cons) {
     pthread_mutex_lock(&q->write_wait_mutex);
-    pthread_cond_broadcast(&q->write_wait_cond); // wake all sleeping threads
+    if(q->sleeping_cons)
+      pthread_cond_broadcast(&q->write_wait_cond); // wake all sleeping threads
     pthread_mutex_unlock(&q->write_wait_mutex);
   }
 }

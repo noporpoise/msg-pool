@@ -157,7 +157,7 @@ int main(int argc, char **argv)
   MsgPool q;
   msgpool_alloc(&q, qlen, sizeof(size_t), nproducers, nconsumers);
 
-  msgpool_init(&q, set_zero, NULL);
+  msgpool_iterate(&q, set_zero, NULL);
 
   run_threads(&q, nmesgs);
 

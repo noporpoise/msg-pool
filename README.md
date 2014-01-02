@@ -14,6 +14,11 @@ Primary use is for sharing tasks when there are multiple producer threads and
 multiple consumer threads.
 We do not worry about latency only total throughput rate.
 
+Features/limitations:
+* fixed size pool
+* messages passed without guarantees about ordering
+* multiple producers / multiple consumer threads
+
 Example
 -------
 
@@ -36,17 +41,18 @@ API
     void msgpool_alloc(MsgPool *q, size_t nel, size_t elsize,
                        size_t nproducers, size_t nconsumers)
 
-Create a new message pool
+Create a new message pool. You can have more than the number of producers/consumers
+that you specify, but if you have fewer you may affect performance.
 
     void msgpool_dealloc(MsgPool *q)
 
 Release a message pool
 
-    void msgpool_init(MsgPool *q,
+    void msgpool_iterate(MsgPool *q,
                       void (*func)(char *el, size_t idx, void *args),
                       void *args)
 
-Set the initial value of elements in the pool. Example:
+Iterate over elements in the pool. Example:
 
     void alloc_elements(char *ptr, size_t i, void *args)
     {
@@ -57,10 +63,10 @@ Set the initial value of elements in the pool. Example:
 
     MsgPool q;
     msgpool_alloc(&q, qlen, sizeof(char*), nproducers, nconsumers);
-    msgpool_init(&q, alloc_elements, NULL);
+    msgpool_iterate(&q, alloc_elements, NULL);
 
-`msgpool_init()` is useful for e.g. initialising all elements to pointers to memory.
-Beware: elements passed to func() function by msgpool_init will not be aligned in
+`msgpool_iterate()` is useful for e.g. initialising all elements to pointers to memory.
+Beware: elements passed to func() function by msgpool_iterate will not be aligned in
 memory.
 
     int msgpool_read(MsgPool *q, void *restrict p, const void *restrict swap)
@@ -89,6 +95,7 @@ Reopen the pool for reading after calling close()
 License
 -------
 
-Public Domain. No warranty. There are probably some bugs.
+Public Domain. No warranty. You may use this code as you wish without
+restrictions. There are probably some bugs.
 
 Please open an issue on github with ideas, bug reports or feature requests.
