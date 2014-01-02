@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <unistd.h> // getpid
-#include "mpmc.h"
+#include "msgpool.h"
 
 #define NPROC_DEFAULT 5
 #define NCONS_DEFAULT 5
@@ -21,7 +21,7 @@ void print_usage()
 }
 
 struct TestThread {
-  MPMCPool *q;
+  MsgPool *q;
   pthread_t th;
   size_t id, start, end;
   size_t result;
@@ -34,7 +34,7 @@ void* produce(void *ptr)
   const struct TestThread *prod = (const struct TestThread*)ptr;
   size_t w;
   printf("Created producer %zu\n", prod->id);
-  for(w = prod->start; w < prod->end; w++) mpmc_write(prod->q, &w, NULL);
+  for(w = prod->start; w < prod->end; w++) msgpool_write(prod->q, &w, NULL);
   printf("Producer %zu finished!\n", prod->id);
   pthread_exit(NULL);
 }
@@ -44,7 +44,7 @@ void* consume(void *ptr)
   struct TestThread *cons = (struct TestThread*)ptr;
   size_t r, sum = 0;
   printf("Created consumer %zu\n", cons->id);
-  while(mpmc_read(cons->q, &r, NULL)) {
+  while(msgpool_read(cons->q, &r, NULL)) {
     // printf("%zu\n", r);
     sum += r;
   }
@@ -53,7 +53,7 @@ void* consume(void *ptr)
   pthread_exit(NULL);
 }
 
-void run_threads(MPMCPool *q, size_t nmesgs)
+void run_threads(MsgPool *q, size_t nmesgs)
 {
   size_t i, nproducers = q->nproducers, nconsumers = q->nconsumers;
   int rc;
@@ -87,7 +87,6 @@ void run_threads(MPMCPool *q, size_t nmesgs)
     producers[i].q = q;
     producers[i].start = start;
     producers[i].end = end;
-    printf("start: %zu end: %zu\n", start, end);
     rc = pthread_create(&producers[i].th, &thread_attr, produce, &producers[i]);
     if(rc != 0) { fprintf(stderr, "Creating thread failed\n"); exit(-1); }
   }
@@ -101,14 +100,14 @@ void run_threads(MPMCPool *q, size_t nmesgs)
   }
 
   // Wait for those jobs to finish before submitting more
-  mpmc_wait_til_empty(q);
+  msgpool_wait_til_empty(q);
 
   for(i = 0; i < 100; i++)
-    mpmc_write(q, &i, NULL);
+    msgpool_write(q, &i, NULL);
 
   size_t extra_sum = 100*(99/2.0);
 
-  mpmc_close(q);
+  msgpool_close(q);
   printf("waiting for consumers to finish...\n");
   size_t sum = 0;
 
@@ -155,14 +154,14 @@ int main(int argc, char **argv)
     else print_usage();
 
   // Create pool of ints of length qlen
-  MPMCPool q;
-  mpmc_alloc(&q, qlen, sizeof(size_t), nproducers, nconsumers);
+  MsgPool q;
+  msgpool_alloc(&q, qlen, sizeof(size_t), nproducers, nconsumers);
 
-  mpmc_init(&q, set_zero, NULL);
+  msgpool_init(&q, set_zero, NULL);
 
   run_threads(&q, nmesgs);
 
-  mpmc_dealloc(&q);
+  msgpool_dealloc(&q);
 
   printf("Done.\n");
   return EXIT_SUCCESS;

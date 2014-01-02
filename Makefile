@@ -10,7 +10,7 @@ all: test
 clean:
 	rm -rf test test.dSYM ptest
 
-test: test.c mpmc.h
+test: test.c msgpool.h
 	$(CC) -Wall -Wextra -std=c99 $(CFLAGS) -o test test.c -lpthread
 
 # ptest: ptest.c pipe/pipe.o

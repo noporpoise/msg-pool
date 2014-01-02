@@ -1,5 +1,5 @@
-#ifndef MPMC_H_
-#define MPMC_H_
+#ifndef MSG_POOL_H_
+#define MSG_POOL_H_
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -8,10 +8,10 @@
 #include <unistd.h>  // need for getpid()
 #include <signal.h> // needed for kill
 
-#define MPMC_EMPTY 0
-#define MPMC_READING 1
-#define MPMC_WRITING 2
-#define MPMC_FULL 3
+#define MPOOL_EMPTY 0
+#define MPOOL_READING 1
+#define MPOOL_WRITING 2
+#define MPOOL_FULL 3
 
 // TODO:
 // * check memory barrier on writes
@@ -33,21 +33,21 @@ typedef struct
   volatile size_t sleeping_prods, sleeping_cons;
   pthread_mutex_t read_wait_mutex, write_wait_mutex;
   pthread_cond_t read_wait_cond, write_wait_cond;
-} MPMCPool;
+} MsgPool;
 
 // Allocate a new pool
-static inline void mpmc_alloc(MPMCPool *q, size_t nel, size_t elsize,
-                              size_t nproducers, size_t nconsumers)
+static inline void msgpool_alloc(MsgPool *q, size_t nel, size_t elsize,
+                                 size_t nproducers, size_t nconsumers)
 {
   // 1 byte per element for locking
   char *data = calloc(nel, elsize+1);
-  MPMCPool tmpq = {.nel = nel, .elsize = elsize, .qsize = elsize+1,
+  MsgPool tmpq = {.nel = nel, .elsize = elsize, .qsize = elsize+1,
                     .qend = (elsize+1)*nel, .data = data,
                     .nproducers = nproducers, .nconsumers = nconsumers,
                     .noccupied = 0, .open = 1,
                     .last_read = 0, .last_write = 0,
                     .sleeping_prods = 0, .sleeping_cons = 0};
-  memcpy(q, &tmpq, sizeof(MPMCPool));
+  memcpy(q, &tmpq, sizeof(MsgPool));
 
   if(pthread_mutex_init(&q->read_wait_mutex, NULL) != 0 ||
      pthread_mutex_init(&q->write_wait_mutex, NULL) != 0)
@@ -64,7 +64,7 @@ static inline void mpmc_alloc(MPMCPool *q, size_t nel, size_t elsize,
 }
 
 // Deallocate a new pool
-static inline void mpmc_dealloc(MPMCPool *q)
+static inline void msgpool_dealloc(MsgPool *q)
 {
   pthread_cond_destroy(&q->read_wait_cond);
   pthread_mutex_destroy(&q->read_wait_mutex);
@@ -74,9 +74,9 @@ static inline void mpmc_dealloc(MPMCPool *q)
 // Initialise elements in an array
 // calls func(el,idx,args) with idx being 0,1,2... and el a pointer to the
 // element (beware: not aligned in memory)
-static inline void mpmc_init(MPMCPool *q,
-                             void (*func)(char *el, size_t idx, void *args),
-                             void *args)
+static inline void msgpool_init(MsgPool *q,
+                                void (*func)(char *el, size_t idx, void *args),
+                                void *args)
 {
   size_t i; char *ptr, *data = (char*)q->data;
   for(i = 0, ptr = data+1; i < q->nel; i++, ptr += q->qsize) {
@@ -85,8 +85,8 @@ static inline void mpmc_init(MPMCPool *q,
 }
 
 // Returns number of bytes read (0 or q->nel)
-static inline int mpmc_read(MPMCPool *q, void *restrict p,
-                            const void *restrict swap)
+static inline int msgpool_read(MsgPool *q, void *restrict p,
+                               const void *restrict swap)
 {
   size_t i, nocc, s = q->last_read;
   while(1)
@@ -111,14 +111,14 @@ static inline int mpmc_read(MPMCPool *q, void *restrict p,
 
     for(i = s; i < q->qend; i += q->qsize)
     {
-      if(__sync_bool_compare_and_swap(&q->data[i], MPMC_FULL, MPMC_READING))
+      if(__sync_bool_compare_and_swap(&q->data[i], MPOOL_FULL, MPOOL_READING))
       {
         q->last_read = i;
         memcpy((char*)p, (char*)q->data+i+1, q->elsize);
         if(swap) memcpy((char*)q->data+i+1, (char*)swap, q->elsize);
-        // memory barrier: must read element before setting MPMC_EMPTY
+        // memory barrier: must read element before setting MPOOL_EMPTY
         __sync_synchronize();
-        q->data[i] = MPMC_EMPTY;
+        q->data[i] = MPOOL_EMPTY;
         // __sync_synchronize();
         nocc = __sync_fetch_and_sub(&q->noccupied, 1); // q->noccupied--
         nocc--;
@@ -144,7 +144,7 @@ static inline int mpmc_read(MPMCPool *q, void *restrict p,
 
 // if til_empty, wait until pool is empty,
 // otherwise wait until space
-static inline void _mpmc_wait(MPMCPool *q, char til_empty)
+static inline void _msgpool_wait(MsgPool *q, char til_empty)
 {
   // printf("waiting until %s\n", til_empty ? "empty" : "space");
   size_t limit = til_empty ? 0 : q->nel - 1;
@@ -159,17 +159,17 @@ static inline void _mpmc_wait(MPMCPool *q, char til_empty)
   // printf("done waiting %zu\n", q->noccupied);
 }
 
-static inline void mpmc_write(MPMCPool *q, const void *restrict p,
-                              void *restrict swap)
+static inline void msgpool_write(MsgPool *q, const void *restrict p,
+                                 void *restrict swap)
 {
   size_t i, nocc, s = q->last_write;
   while(1)
   {
-    while(q->noccupied == q->nel) _mpmc_wait(q, 0);
+    while(q->noccupied == q->nel) _msgpool_wait(q, 0);
 
     for(i = s; i < q->qend; i += q->qsize)
     {
-      if(__sync_bool_compare_and_swap(&q->data[i], MPMC_EMPTY, MPMC_WRITING))
+      if(__sync_bool_compare_and_swap(&q->data[i], MPOOL_EMPTY, MPOOL_WRITING))
       {
         q->last_write = i;
         if(swap) memcpy((char*)swap, (char*)q->data+i+1, q->elsize);
@@ -177,7 +177,7 @@ static inline void mpmc_write(MPMCPool *q, const void *restrict p,
         // memory barrier on writes: must write element before writing status
         // dev: may not be needed on x86, this is already promised
         // __sync_synchronize();
-        q->data[i] = MPMC_FULL;
+        q->data[i] = MPOOL_FULL;
         // __sync_synchronize();
         nocc = __sync_fetch_and_add(&q->noccupied, 1); // q->noccupied++
         nocc++;
@@ -201,14 +201,15 @@ static inline void mpmc_write(MPMCPool *q, const void *restrict p,
   }
 }
 
-// Wait until the pool is empty, keep mpmc_read() blocking
-static inline void mpmc_wait_til_empty(MPMCPool *q)
+// Wait until the pool is empty, keep msgpool_read() blocking
+static inline void msgpool_wait_til_empty(MsgPool *q)
 {
-  _mpmc_wait(q, 1);
+  _msgpool_wait(q, 1);
 }
 
-// Close causes mpmc_read() to return 0 if pool is empty
-static inline void mpmc_close(MPMCPool *q) {
+// Close causes msgpool_read() to return 0 if pool is empty
+static inline void msgpool_close(MsgPool *q)
+{
   q->open = 0;
   if(q->sleeping_cons) {
     pthread_mutex_lock(&q->write_wait_mutex);
@@ -217,8 +218,8 @@ static inline void mpmc_close(MPMCPool *q) {
   }
 }
 
-static inline void mpmc_reopen(MPMCPool *q) {
+static inline void msgpool_reopen(MsgPool *q) {
   q->open = 1;
 }
 
-#endif /* MPMC_H_ */
+#endif /* MSG_POOL_H_ */
