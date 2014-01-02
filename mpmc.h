@@ -33,38 +33,60 @@ typedef struct
   volatile size_t sleeping_prods, sleeping_cons;
   pthread_mutex_t read_wait_mutex, write_wait_mutex;
   pthread_cond_t read_wait_cond, write_wait_cond;
-} MPMCQueue;
+} MPMCPool;
 
-// Allocate a new queue
-static inline void mpmc_alloc(MPMCQueue *q, size_t nel, size_t elsize,
+// Allocate a new pool
+static inline void mpmc_alloc(MPMCPool *q, size_t nel, size_t elsize,
                               size_t nproducers, size_t nconsumers)
 {
+  // 1 byte per element for locking
   char *data = calloc(nel, elsize+1);
-  MPMCQueue tmpq = {.nel = nel, .elsize = elsize, .qsize = elsize+1,
+  MPMCPool tmpq = {.nel = nel, .elsize = elsize, .qsize = elsize+1,
                     .qend = (elsize+1)*nel, .data = data,
                     .nproducers = nproducers, .nconsumers = nconsumers,
                     .noccupied = 0, .open = 1,
                     .last_read = 0, .last_write = 0,
                     .sleeping_prods = 0, .sleeping_cons = 0};
-  memcpy(q, &tmpq, sizeof(MPMCQueue));
+  memcpy(q, &tmpq, sizeof(MPMCPool));
+
   if(pthread_mutex_init(&q->read_wait_mutex, NULL) != 0 ||
      pthread_mutex_init(&q->write_wait_mutex, NULL) != 0)
-  { fprintf(stderr, "pthread_mutex init failed\n"); abort(); }
+  {
+    fprintf(stderr, "pthread_mutex init failed\n");
+    abort();
+  }
   if(pthread_cond_init(&q->read_wait_cond, NULL) != 0 ||
     pthread_cond_init(&q->write_wait_cond, NULL) != 0)
-  { fprintf(stderr, "pthread_cond init failed\n"); abort(); }
+  {
+    fprintf(stderr, "pthread_cond init failed\n");
+    abort();
+  }
 }
 
-// Deallocate a new queue
-static inline void mpmc_dealloc(MPMCQueue *q)
+// Deallocate a new pool
+static inline void mpmc_dealloc(MPMCPool *q)
 {
   pthread_cond_destroy(&q->read_wait_cond);
   pthread_mutex_destroy(&q->read_wait_mutex);
   free((char*)q->data);
 }
 
+// Initialise elements in an array
+// calls func(el,idx,args) with idx being 0,1,2... and el a pointer to the
+// element (beware: not aligned in memory)
+static inline void mpmc_init(MPMCPool *q,
+                             void (*func)(char *el, size_t idx, void *args),
+                             void *args)
+{
+  size_t i; char *ptr, *data = (char*)q->data;
+  for(i = 0, ptr = data+1; i < q->nel; i++, ptr += q->qsize) {
+    func(ptr, i, args);
+  }
+}
+
 // Returns number of bytes read (0 or q->nel)
-static inline int mpmc_read(MPMCQueue *q, void *p)
+static inline int mpmc_read(MPMCPool *q, void *restrict p,
+                            const void *restrict swap)
 {
   size_t i, nocc, s = q->last_read;
   while(1)
@@ -73,11 +95,16 @@ static inline int mpmc_read(MPMCQueue *q, void *p)
       if(!q->open) return 0;
       else {
         // Wait on write
+        // don't need to use __sync_fetch_and_add because we have write_wait_mutex
         pthread_mutex_lock(&q->write_wait_mutex);
-        __sync_fetch_and_add(&q->sleeping_cons, 1); // atomic q->sleeping_cons++
+        // __sync_fetch_and_add(&q->sleeping_cons, 1);
+        q->sleeping_cons++;
+
         while(q->noccupied == 0 && q->open)
           pthread_cond_wait(&q->write_wait_cond, &q->write_wait_mutex);
-        __sync_fetch_and_sub(&q->sleeping_cons, 1); // atomic q->sleeping_cons--
+
+        // __sync_fetch_and_sub(&q->sleeping_cons, 1);
+        q->sleeping_cons--;
         pthread_mutex_unlock(&q->write_wait_mutex);
       }
     }
@@ -88,6 +115,7 @@ static inline int mpmc_read(MPMCQueue *q, void *p)
       {
         q->last_read = i;
         memcpy((char*)p, (char*)q->data+i+1, q->elsize);
+        if(swap) memcpy((char*)q->data+i+1, (char*)swap, q->elsize);
         // memory barrier: must read element before setting MPMC_EMPTY
         __sync_synchronize();
         q->data[i] = MPMC_EMPTY;
@@ -99,7 +127,7 @@ static inline int mpmc_read(MPMCQueue *q, void *p)
         size_t nproducers = q->nproducers-q->sleeping_prods;
         if(q->sleeping_prods && nproducers < q->nel-nocc)
         {
-          // Notify when space appears in queue or queue empty
+          // Notify when space appears in pool or pool empty
           pthread_mutex_lock(&q->read_wait_mutex);
           pthread_cond_signal(&q->read_wait_cond); // wake one
           pthread_mutex_unlock(&q->read_wait_mutex);
@@ -114,9 +142,9 @@ static inline int mpmc_read(MPMCQueue *q, void *p)
   return 0;
 }
 
-// if til_empty, wait until queue is empty,
+// if til_empty, wait until pool is empty,
 // otherwise wait until space
-static inline void _mpmc_wait(MPMCQueue *q, char til_empty)
+static inline void _mpmc_wait(MPMCPool *q, char til_empty)
 {
   // printf("waiting until %s\n", til_empty ? "empty" : "space");
   size_t limit = til_empty ? 0 : q->nel - 1;
@@ -131,7 +159,8 @@ static inline void _mpmc_wait(MPMCQueue *q, char til_empty)
   // printf("done waiting %zu\n", q->noccupied);
 }
 
-static inline void mpmc_write(MPMCQueue *q, void *p)
+static inline void mpmc_write(MPMCPool *q, const void *restrict p,
+                              void *restrict swap)
 {
   size_t i, nocc, s = q->last_write;
   while(1)
@@ -143,6 +172,7 @@ static inline void mpmc_write(MPMCQueue *q, void *p)
       if(__sync_bool_compare_and_swap(&q->data[i], MPMC_EMPTY, MPMC_WRITING))
       {
         q->last_write = i;
+        if(swap) memcpy((char*)swap, (char*)q->data+i+1, q->elsize);
         memcpy((char*)q->data+i+1, (char*)p, q->elsize);
         // memory barrier on writes: must write element before writing status
         // dev: may not be needed on x86, this is already promised
@@ -171,23 +201,23 @@ static inline void mpmc_write(MPMCQueue *q, void *p)
   }
 }
 
-// Wait until the queue is empty, keep mpmc_read() blocking
-static inline void mpmc_wait_til_empty(MPMCQueue *q)
+// Wait until the pool is empty, keep mpmc_read() blocking
+static inline void mpmc_wait_til_empty(MPMCPool *q)
 {
   _mpmc_wait(q, 1);
 }
 
-// Close causes mpmc_read() to return 0 if queue is empty
-static inline void mpmc_close(MPMCQueue *q) {
+// Close causes mpmc_read() to return 0 if pool is empty
+static inline void mpmc_close(MPMCPool *q) {
   q->open = 0;
   if(q->sleeping_cons) {
     pthread_mutex_lock(&q->write_wait_mutex);
-    pthread_cond_broadcast(&q->write_wait_cond); // wake one
+    pthread_cond_broadcast(&q->write_wait_cond); // wake all sleeping threads
     pthread_mutex_unlock(&q->write_wait_mutex);
   }
 }
 
-static inline void mpmc_reopen(MPMCQueue *q) {
+static inline void mpmc_reopen(MPMCPool *q) {
   q->open = 1;
 }
 
