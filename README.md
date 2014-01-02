@@ -34,7 +34,7 @@ API
 ---
 
     void msgpool_alloc(MsgPool *q, size_t nel, size_t elsize,
-                    size_t nproducers, size_t nconsumers)
+                       size_t nproducers, size_t nconsumers)
 
 Create a new message pool
 
@@ -43,8 +43,8 @@ Create a new message pool
 Release a message pool
 
     void msgpool_init(MsgPool *q,
-                   void (*func)(char *el, size_t idx, void *args),
-                   void *args)
+                      void (*func)(char *el, size_t idx, void *args),
+                      void *args)
 
 Set the initial value of elements in the pool. Example:
 
