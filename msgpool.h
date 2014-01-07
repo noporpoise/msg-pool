@@ -21,7 +21,7 @@ typedef struct
 {
   // qsize = elsize+1, qend=(qsize)*nel
   const size_t nel, elsize, qsize, qend;
-  size_t nproducers, nconsumers;
+  const size_t nproducers, nconsumers;
   volatile size_t noccupied, last_read, last_write;
   volatile char *const data; // [<state><element>]+
 
@@ -30,28 +30,46 @@ typedef struct
   volatile char open;
 
   // Mutexes for waiting
+  const int use_spinlock; // whether to spin or use mutex
   // number of write threads waiting for read, and vice versa
   volatile size_t sleeping_prods, sleeping_cons;
   pthread_mutex_t read_wait_mutex, write_wait_mutex;
   pthread_cond_t read_wait_cond, write_wait_cond;
 } MsgPool;
 
-// Allocate a new pool
-static inline void msgpool_alloc(MsgPool *q, size_t nel, size_t elsize,
-                                 size_t nproducers, size_t nconsumers)
+
+static inline void msgpool_alloc_spinlock(MsgPool *q, size_t nel, size_t elsize)
 {
   // 1 byte per element for locking
   char *data = calloc(nel, elsize+1);
   MsgPool tmpq = {.nel = nel, .elsize = elsize, .qsize = elsize+1,
-                    .qend = (elsize+1)*nel, .data = data,
-                    .nproducers = nproducers, .nconsumers = nconsumers,
-                    .noccupied = 0, .open = 1,
-                    .last_read = 0, .last_write = 0,
-                    .sleeping_prods = 0, .sleeping_cons = 0};
-  memcpy(q, &tmpq, sizeof(MsgPool));
+                  .qend = (elsize+1)*nel, .data = data,
+                  .nproducers = 0, .nconsumers = 0,
+                  .noccupied = 0, .open = 1,
+                  .last_read = 0, .last_write = 0,
+                  .sleeping_prods = 0, .sleeping_cons = 0,
+                  .use_spinlock = 1};
 
-  assert(nconsumers < nel);
-  assert(nproducers < nel);
+  memcpy(q, &tmpq, sizeof(MsgPool));
+}
+
+static inline void msgpool_alloc_mutex(MsgPool *q, size_t nel, size_t elsize,
+                                       size_t nproducers, size_t nconsumers)
+{
+  assert(nconsumers > 0 && nconsumers < nel);
+  assert(nproducers > 0 && nproducers < nel);
+
+  // 1 byte per element for locking
+  char *data = calloc(nel, elsize+1);
+  MsgPool tmpq = {.nel = nel, .elsize = elsize, .qsize = elsize+1,
+                  .qend = (elsize+1)*nel, .data = data,
+                  .nproducers = nproducers, .nconsumers = nconsumers,
+                  .noccupied = 0, .open = 1,
+                  .last_read = 0, .last_write = 0,
+                  .sleeping_prods = 0, .sleeping_cons = 0,
+                  .use_spinlock = 0};
+
+  memcpy(q, &tmpq, sizeof(MsgPool));
 
   if(pthread_mutex_init(&q->read_wait_mutex, NULL) != 0 ||
      pthread_mutex_init(&q->write_wait_mutex, NULL) != 0)
@@ -96,8 +114,13 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
   size_t i, nocc, s = q->last_read;
   while(1)
   {
-    if(q->noccupied == 0) {
+    if(q->noccupied == 0)
+    {
+      // Wait until something is read in or message pool is closed
       if(!q->open) return 0;
+      else if(q->use_spinlock) {
+        while(q->noccupied == 0 && q->open) {}
+      }
       else {
         // Wait on write
         // don't need to use __sync_fetch_and_add because we have write_wait_mutex
@@ -112,6 +135,8 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
         q->sleeping_cons--;
         pthread_mutex_unlock(&q->write_wait_mutex);
       }
+
+      if(q->noccupied == 0 && !q->open) return 0;
     }
 
     for(i = s; i < q->qend; i += q->qsize)
@@ -129,15 +154,18 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
         nocc--;
         // __sync_synchronize();
 
-        size_t nproducers = q->nproducers-q->sleeping_prods;
-        if(q->sleeping_prods &&
-           (nproducers < q->nel-nocc || nproducers == 0 || nocc == 0))
+        if(!q->use_spinlock)
         {
-          // Notify when space appears in pool or pool empty
-          pthread_mutex_lock(&q->read_wait_mutex);
-          if(q->sleeping_prods)
-            pthread_cond_signal(&q->read_wait_cond); // wake one
-          pthread_mutex_unlock(&q->read_wait_mutex);
+          size_t nproducers = q->nproducers - q->sleeping_prods;
+          if(q->sleeping_prods &&
+             (nproducers < q->nel-nocc || nproducers == 0 || nocc == 0))
+          {
+            // Notify when space appears in pool or pool empty
+            pthread_mutex_lock(&q->read_wait_mutex);
+            if(q->sleeping_prods)
+              pthread_cond_signal(&q->read_wait_cond); // wake one
+            pthread_mutex_unlock(&q->read_wait_mutex);
+          }
         }
 
         return q->elsize;
@@ -156,12 +184,17 @@ static inline void _msgpool_wait(MsgPool *q, char til_empty)
   // printf("waiting until %s\n", til_empty ? "empty" : "space");
   size_t limit = til_empty ? 0 : q->nel - 1;
   if(q->noccupied > limit) {
-    pthread_mutex_lock(&q->read_wait_mutex);
-    __sync_fetch_and_add(&q->sleeping_prods, 1); // atomic q->sleeping_prods++
-    while(q->noccupied > limit)
-      pthread_cond_wait(&q->read_wait_cond, &q->read_wait_mutex);
-    __sync_fetch_and_sub(&q->sleeping_prods, 1); // atomic q->sleeping_prods--
-    pthread_mutex_unlock(&q->read_wait_mutex);
+    if(q->use_spinlock) {
+      while(q->noccupied > limit) {}
+    }
+    else {
+      pthread_mutex_lock(&q->read_wait_mutex);
+      __sync_fetch_and_add(&q->sleeping_prods, 1); // atomic q->sleeping_prods++
+      while(q->noccupied > limit)
+        pthread_cond_wait(&q->read_wait_cond, &q->read_wait_mutex);
+      __sync_fetch_and_sub(&q->sleeping_prods, 1); // atomic q->sleeping_prods--
+      pthread_mutex_unlock(&q->read_wait_mutex);
+    }
   }
   // printf("done waiting %zu\n", q->noccupied);
 }
@@ -172,7 +205,8 @@ static inline void msgpool_write(MsgPool *q, const void *restrict p,
   size_t i, nocc, s = q->last_write;
   while(1)
   {
-    while(q->noccupied == q->nel) _msgpool_wait(q, 0);
+    // Wait until there is space to write
+    _msgpool_wait(q, 0);
 
     for(i = s; i < q->qend; i += q->qsize)
     {
@@ -190,15 +224,18 @@ static inline void msgpool_write(MsgPool *q, const void *restrict p,
         nocc++;
         // __sync_synchronize();
 
-        size_t nconsumers = q->nconsumers - q->sleeping_cons;
-        if(q->sleeping_cons &&
-           (nconsumers < nocc || nconsumers == 0 || q->noccupied == q->nel))
+        if(!q->use_spinlock)
         {
-          // Notify when element written
-          pthread_mutex_lock(&q->write_wait_mutex);
-          if(q->sleeping_cons)
-            pthread_cond_signal(&q->write_wait_cond); // wake reading thread
-          pthread_mutex_unlock(&q->write_wait_mutex);
+          size_t nconsumers = q->nconsumers - q->sleeping_cons;
+          if(q->sleeping_cons &&
+             (nconsumers < nocc || nconsumers == 0 || q->noccupied == q->nel))
+          {
+            // Notify waiting readers when element written
+            pthread_mutex_lock(&q->write_wait_mutex);
+            if(q->sleeping_cons)
+              pthread_cond_signal(&q->write_wait_cond); // wake reading thread
+            pthread_mutex_unlock(&q->write_wait_mutex);
+          }
         }
 
         return;
@@ -220,7 +257,7 @@ static inline void msgpool_wait_til_empty(MsgPool *q)
 static inline void msgpool_close(MsgPool *q)
 {
   q->open = 0;
-  if(q->sleeping_cons) {
+  if(!q->use_spinlock && q->sleeping_cons) {
     pthread_mutex_lock(&q->write_wait_mutex);
     if(q->sleeping_cons)
       pthread_cond_broadcast(&q->write_wait_cond); // wake all sleeping threads

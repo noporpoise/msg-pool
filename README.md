@@ -38,11 +38,18 @@ Example
 API
 ---
 
-    void msgpool_alloc(MsgPool *q, size_t nel, size_t elsize,
-                       size_t nproducers, size_t nconsumers)
+    void msgpool_alloc_spinlock(MsgPool *q, size_t nel, size_t elsize)
 
-Create a new message pool. You can have more than the number of producers/consumers
-that you specify, but if you have fewer you may affect performance.
+Create a new message pool using spinlocks to block. This approach may be fastest
+if you have more CPU cores than threads.
+
+    void msgpool_alloc_mutex(MsgPool *q, size_t nel, size_t elsize,
+                             size_t nproducers, size_t nconsumers)
+
+Create a new message pool using mutexes to block. You can have more than the
+number of producers/consumers that you specify, but if you have fewer you may
+affect performance.  This approach is probably faster if you have multiple
+threads running per CPU core.
 
     void msgpool_dealloc(MsgPool *q)
 

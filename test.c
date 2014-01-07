@@ -53,12 +53,15 @@ void* consume(void *ptr)
   pthread_exit(NULL);
 }
 
-void run_threads(MsgPool *q, size_t nmesgs)
+void run_threads(MsgPool *q, size_t nmesgs, size_t nproducers, size_t nconsumers)
 {
-  size_t i, nproducers = q->nproducers, nconsumers = q->nconsumers;
+  size_t i;
   int rc;
 
-  printf("nproducers: %zu nconsumers: %zu n: %zu qlen: %zu\n",
+  printf("Using %s\n", q->use_spinlock ? "spinlock" : "mutexes");
+
+  printf("nproducers [-p]: %zu nconsumers [-c]: %zu "
+         "messages [-n]: %zu qlen [-q]: %zu\n",
          nproducers, nconsumers, nmesgs, q->nel);
 
   // Thread attributes
@@ -143,23 +146,30 @@ int main(int argc, char **argv)
   // pass 1000000 messages
   size_t nmesgs = NMESG_DEFAULT;
 
+  // use spinlock instead of mutex
+  int spinlock = 1;
+
   // Read args
   int c;
 
-  while ((c = getopt(argc, argv, "p:c:n:q:h")) >= 0)
+  while ((c = getopt(argc, argv, "p:c:n:q:m")) >= 0)
     if (c == 'p') nproducers = atoi(optarg);
     else if (c == 'c') nconsumers = atoi(optarg);
     else if (c == 'n') nmesgs = atoi(optarg);
     else if (c == 'q') qlen = atoi(optarg);
+    else if (c == 'm') spinlock = 0;
     else print_usage();
 
   // Create pool of ints of length qlen
   MsgPool q;
-  msgpool_alloc(&q, qlen, sizeof(size_t), nproducers, nconsumers);
+  if(spinlock)
+    msgpool_alloc_spinlock(&q, qlen, sizeof(size_t));
+  else
+    msgpool_alloc_mutex(&q, qlen, sizeof(size_t), nproducers, nconsumers);
 
   msgpool_iterate(&q, set_zero, NULL);
 
-  run_threads(&q, nmesgs);
+  run_threads(&q, nmesgs, nproducers, nconsumers);
 
   msgpool_dealloc(&q);
 
