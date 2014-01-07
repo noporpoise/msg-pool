@@ -2,7 +2,7 @@
 ifdef DEBUG
 	CFLAGS = -g -ggdb -O0
 else
-	CFLAGS = -O2
+	CFLAGS = -O3
 endif
 
 all: test

@@ -22,15 +22,15 @@ typedef struct
   // qsize = elsize+1, qend=(qsize)*nel
   const size_t nel, elsize, qsize, qend;
   const size_t nproducers, nconsumers;
-  volatile size_t noccupied, last_read, last_write;
-  volatile char *const data; // [<state><element>]+
+  volatile size_t noccupied, last_read, last_write; // these should not be volatile?
+  char *const data; // [<state><element>]+
 
   // reads block until success if open is != 0
   // otherwise they return 0
   volatile char open;
 
   // Mutexes for waiting
-  const int use_spinlock; // whether to spin or use mutex
+  const char use_spinlock; // whether to spin or use mutex
   // number of write threads waiting for read, and vice versa
   volatile size_t sleeping_prods, sleeping_cons;
   pthread_mutex_t read_wait_mutex, write_wait_mutex;
@@ -90,7 +90,7 @@ static inline void msgpool_dealloc(MsgPool *q)
 {
   pthread_cond_destroy(&q->read_wait_cond);
   pthread_mutex_destroy(&q->read_wait_mutex);
-  free((char*)q->data);
+  free(q->data);
 }
 
 // Iterate over elements in the pool
@@ -101,7 +101,7 @@ static inline void msgpool_iterate(MsgPool *q,
                                    void (*func)(char *el, size_t idx, void *args),
                                    void *args)
 {
-  size_t i; char *ptr, *data = (char*)q->data;
+  size_t i; char *ptr, *data = q->data;
   for(i = 0, ptr = data+1; i < q->nel; i++, ptr += q->qsize) {
     func(ptr, i, args);
   }
@@ -141,18 +141,22 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
 
     for(i = s; i < q->qend; i += q->qsize)
     {
-      if(__sync_bool_compare_and_swap(&q->data[i], MPOOL_FULL, MPOOL_READING))
+      if(__sync_bool_compare_and_swap((volatile char*)&q->data[i],
+                                      MPOOL_FULL, MPOOL_READING))
       {
         q->last_read = i;
-        memcpy((char*)p, (char*)q->data+i+1, q->elsize);
-        if(swap) memcpy((char*)q->data+i+1, (char*)swap, q->elsize);
+        memcpy(p, q->data+i+1, q->elsize);
+        if(swap) memcpy(q->data+i+1, swap, q->elsize);
+
         // memory barrier: must read element before setting MPOOL_EMPTY
         __sync_synchronize();
+
+        // Order of next two operations is not important
         q->data[i] = MPOOL_EMPTY;
-        // __sync_synchronize();
-        nocc = __sync_fetch_and_sub(&q->noccupied, 1); // q->noccupied--
-        nocc--;
-        // __sync_synchronize();
+        // q->noccupied--; fetch_and_sub returns old value
+        nocc = __sync_fetch_and_sub(&q->noccupied, 1) - 1;
+
+        __sync_synchronize();
 
         if(!q->use_spinlock)
         {
@@ -210,19 +214,22 @@ static inline void msgpool_write(MsgPool *q, const void *restrict p,
 
     for(i = s; i < q->qend; i += q->qsize)
     {
-      if(__sync_bool_compare_and_swap(&q->data[i], MPOOL_EMPTY, MPOOL_WRITING))
+      if(__sync_bool_compare_and_swap((volatile char*)&q->data[i],
+                                      MPOOL_EMPTY, MPOOL_WRITING))
       {
         q->last_write = i;
-        if(swap) memcpy((char*)swap, (char*)q->data+i+1, q->elsize);
-        memcpy((char*)q->data+i+1, (char*)p, q->elsize);
+        if(swap) memcpy(swap, q->data+i+1, q->elsize);
+        memcpy(q->data+i+1, p, q->elsize);
+
         // memory barrier on writes: must write element before writing status
         // dev: may not be needed on x86, this is already promised
-        // __sync_synchronize();
+        __sync_synchronize();
+
         q->data[i] = MPOOL_FULL;
-        // __sync_synchronize();
-        nocc = __sync_fetch_and_add(&q->noccupied, 1); // q->noccupied++
-        nocc++;
-        // __sync_synchronize();
+        // q->noccupied++; fetch_and_add returns old value
+        nocc = __sync_fetch_and_add(&q->noccupied, 1) + 1;
+
+        __sync_synchronize();
 
         if(!q->use_spinlock)
         {
