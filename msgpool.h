@@ -6,7 +6,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>  // need for getpid()
-#include <signal.h> // needed for kill
+#include <signal.h> // needed for abort()
 #include <assert.h>
 
 #define MPOOL_EMPTY 0
@@ -14,23 +14,23 @@
 #define MPOOL_WRITING 2
 #define MPOOL_FULL 3
 
-// TODO:
-// * check memory barrier on writes
-
 typedef struct
 {
   // qsize = elsize+1, qend=(qsize)*nel
   const size_t nel, elsize, qsize, qend;
-  const size_t nproducers, nconsumers;
-  volatile size_t noccupied, last_read, last_write; // these should not be volatile?
+
+  volatile size_t noccupied, last_read, last_write;
   char *const data; // [<state><element>]+
 
   // reads block until success if open is != 0
   // otherwise they return 0
   volatile char open;
 
-  // Mutexes for waiting
-  const char use_spinlock; // whether to spin or use mutex
+  // Blocking / locking
+  const char use_spinlock; // whether to use spinlock or mutexes
+
+  // Mutexes
+  const size_t nproducers, nconsumers;
   // number of write threads waiting for read, and vice versa
   volatile size_t sleeping_prods, sleeping_cons;
   pthread_mutex_t read_wait_mutex, write_wait_mutex;
@@ -107,38 +107,62 @@ static inline void msgpool_iterate(MsgPool *q,
   }
 }
 
+// if til_empty, wait until pool is empty,
+// otherwise wait until space
+static inline void _msgpool_wait_for_read(MsgPool *q, char til_empty)
+{
+  // printf("waiting until %s\n", til_empty ? "empty" : "space");
+  size_t limit = til_empty ? 0 : q->nel - 1;
+  if(q->noccupied > limit) {
+    if(q->use_spinlock) {
+      while(q->noccupied > limit) {}
+    }
+    else {
+      pthread_mutex_lock(&q->read_wait_mutex);
+      q->sleeping_prods++;
+
+      while(q->noccupied > limit)
+        pthread_cond_wait(&q->read_wait_cond, &q->read_wait_mutex);
+
+      q->sleeping_prods--;
+      pthread_mutex_unlock(&q->read_wait_mutex);
+    }
+  }
+}
+
+// Wait until there is at least one element in the pool or it is closed
+static inline void _msgpool_wait_for_write(MsgPool *q)
+{
+  if(q->noccupied == 0 && q->open)
+  {
+    // Wait on write
+    if(q->use_spinlock) {
+      while(q->noccupied == 0 && q->open) {}
+    }
+    else {
+      // don't need to use __sync_fetch_and_add because we have write_wait_mutex
+      pthread_mutex_lock(&q->write_wait_mutex);
+      q->sleeping_cons++;
+
+      while(q->noccupied == 0 && q->open)
+        pthread_cond_wait(&q->write_wait_cond, &q->write_wait_mutex);
+
+      q->sleeping_cons--;
+      pthread_mutex_unlock(&q->write_wait_mutex);
+    }
+  }
+}
+
 // Returns number of bytes read (0 or q->nel)
 static inline int msgpool_read(MsgPool *q, void *restrict p,
                                const void *restrict swap)
 {
+  _msgpool_wait_for_write(q);
+  if(q->noccupied == 0 && !q->open) return 0;
+
   size_t i, nocc, s = q->last_read;
   while(1)
   {
-    if(q->noccupied == 0)
-    {
-      // Wait until something is read in or message pool is closed
-      if(!q->open) return 0;
-      else if(q->use_spinlock) {
-        while(q->noccupied == 0 && q->open) {}
-      }
-      else {
-        // Wait on write
-        // don't need to use __sync_fetch_and_add because we have write_wait_mutex
-        pthread_mutex_lock(&q->write_wait_mutex);
-        // __sync_fetch_and_add(&q->sleeping_cons, 1);
-        q->sleeping_cons++;
-
-        while(q->noccupied == 0 && q->open)
-          pthread_cond_wait(&q->write_wait_cond, &q->write_wait_mutex);
-
-        // __sync_fetch_and_sub(&q->sleeping_cons, 1);
-        q->sleeping_cons--;
-        pthread_mutex_unlock(&q->write_wait_mutex);
-      }
-
-      if(q->noccupied == 0 && !q->open) return 0;
-    }
-
     for(i = s; i < q->qend; i += q->qsize)
     {
       if(__sync_bool_compare_and_swap((volatile char*)&q->data[i],
@@ -175,43 +199,23 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
         return q->elsize;
       }
     }
+
     s = 0;
+    _msgpool_wait_for_write(q);
+    if(q->noccupied == 0 && !q->open) return 0;
   }
 
   return 0;
 }
 
-// if til_empty, wait until pool is empty,
-// otherwise wait until space
-static inline void _msgpool_wait(MsgPool *q, char til_empty)
-{
-  // printf("waiting until %s\n", til_empty ? "empty" : "space");
-  size_t limit = til_empty ? 0 : q->nel - 1;
-  if(q->noccupied > limit) {
-    if(q->use_spinlock) {
-      while(q->noccupied > limit) {}
-    }
-    else {
-      pthread_mutex_lock(&q->read_wait_mutex);
-      __sync_fetch_and_add(&q->sleeping_prods, 1); // atomic q->sleeping_prods++
-      while(q->noccupied > limit)
-        pthread_cond_wait(&q->read_wait_cond, &q->read_wait_mutex);
-      __sync_fetch_and_sub(&q->sleeping_prods, 1); // atomic q->sleeping_prods--
-      pthread_mutex_unlock(&q->read_wait_mutex);
-    }
-  }
-  // printf("done waiting %zu\n", q->noccupied);
-}
-
 static inline void msgpool_write(MsgPool *q, const void *restrict p,
                                  void *restrict swap)
 {
+  _msgpool_wait_for_read(q, 0);
   size_t i, nocc, s = q->last_write;
+
   while(1)
   {
-    // Wait until there is space to write
-    _msgpool_wait(q, 0);
-
     for(i = s; i < q->qend; i += q->qsize)
     {
       if(__sync_bool_compare_and_swap((volatile char*)&q->data[i],
@@ -250,14 +254,15 @@ static inline void msgpool_write(MsgPool *q, const void *restrict p,
     }
 
     s = 0;
-    // printf("Duh!\n");
+    // Wait until there is space to write
+    _msgpool_wait_for_read(q, 0);
   }
 }
 
 // Wait until the pool is empty, keep msgpool_read() blocking
 static inline void msgpool_wait_til_empty(MsgPool *q)
 {
-  _msgpool_wait(q, 1);
+  _msgpool_wait_for_read(q, 1);
 }
 
 // Close causes msgpool_read() to return 0 if pool is empty
