@@ -18,16 +18,17 @@ Features/limitations:
 * fixed size pool
 * messages passed without guarantees about ordering
 * multiple producers / multiple consumer threads
+* lockless except when pool is full or empty
 
 Example
 -------
 
     MsgPool q;
-    msgpool_alloc(&q, qlen, sizeof(size_t), nproducers, nconsumers);
+    msgpool_alloc_spinlock(&q, qlen, sizeof(int));
 
     // Reader threads
     int read;
-    msgpool_read(&q, &r, NULL);
+    while(msgpool_read(&q, &r, NULL)) printf("Got %i\n", r);
 
     // Writer threads
     int w = 12;
@@ -56,8 +57,8 @@ threads running per CPU core.
 Release a message pool
 
     void msgpool_iterate(MsgPool *q,
-                      void (*func)(char *el, size_t idx, void *args),
-                      void *args)
+                         void (*func)(char *el, size_t idx, void *args),
+                         void *args)
 
 Iterate over elements in the pool. Example:
 
@@ -65,7 +66,7 @@ Iterate over elements in the pool. Example:
     {
       (void)args; (void)i;
       char *tmp = malloc(100);
-      memcpy(ptr, &tmp, sizeof(size_t));
+      memcpy(ptr, &tmp, sizeof(char*));
     }
 
     MsgPool q;
