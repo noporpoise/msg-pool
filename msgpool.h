@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
+#include <sched.h> // sched_yield()
 #include <unistd.h>  // need for getpid()
 #include <signal.h> // needed for abort()
 #include <assert.h>
@@ -13,6 +14,10 @@
 #define MPOOL_READING 1
 #define MPOOL_WRITING 2
 #define MPOOL_FULL 3
+
+#define MSGP_LOCK_SPIN 0
+#define MSGP_LOCK_MUTEX 1
+#define MSGP_LOCK_YIELD 2
 
 typedef struct
 {
@@ -27,7 +32,7 @@ typedef struct
   volatile char open;
 
   // Blocking / locking
-  const char use_spinlock; // whether to use spinlock or mutexes
+  const char locking;
 
   // Mutexes
   const size_t nproducers, nconsumers;
@@ -48,7 +53,7 @@ static inline void msgpool_alloc_spinlock(MsgPool *q, size_t nel, size_t elsize)
                   .noccupied = 0, .open = 1,
                   .last_read = 0, .last_write = 0,
                   .sleeping_prods = 0, .sleeping_cons = 0,
-                  .use_spinlock = 1};
+                  .locking = MSGP_LOCK_SPIN};
 
   memcpy(q, &tmpq, sizeof(MsgPool));
 }
@@ -67,7 +72,7 @@ static inline void msgpool_alloc_mutex(MsgPool *q, size_t nel, size_t elsize,
                   .noccupied = 0, .open = 1,
                   .last_read = 0, .last_write = 0,
                   .sleeping_prods = 0, .sleeping_cons = 0,
-                  .use_spinlock = 0};
+                  .locking = MSGP_LOCK_MUTEX};
 
   memcpy(q, &tmpq, sizeof(MsgPool));
 
@@ -83,6 +88,21 @@ static inline void msgpool_alloc_mutex(MsgPool *q, size_t nel, size_t elsize,
     fprintf(stderr, "pthread_cond init failed\n");
     abort();
   }
+}
+
+static inline void msgpool_alloc_yield(MsgPool *q, size_t nel, size_t elsize)
+{
+  // 1 byte per element for locking
+  char *data = calloc(nel, elsize+1);
+  MsgPool tmpq = {.nel = nel, .elsize = elsize, .qsize = elsize+1,
+                  .qend = (elsize+1)*nel, .data = data,
+                  .nproducers = 0, .nconsumers = 0,
+                  .noccupied = 0, .open = 1,
+                  .last_read = 0, .last_write = 0,
+                  .sleeping_prods = 0, .sleeping_cons = 0,
+                  .locking = MSGP_LOCK_YIELD};
+
+  memcpy(q, &tmpq, sizeof(MsgPool));
 }
 
 // Deallocate a new pool
@@ -114,18 +134,23 @@ static inline void _msgpool_wait_for_read(MsgPool *q, char til_empty)
   // printf("waiting until %s\n", til_empty ? "empty" : "space");
   size_t limit = til_empty ? 0 : q->nel - 1;
   if(q->noccupied > limit) {
-    if(q->use_spinlock) {
-      while(q->noccupied > limit) {}
-    }
-    else {
-      pthread_mutex_lock(&q->read_wait_mutex);
-      q->sleeping_prods++;
-
-      while(q->noccupied > limit)
-        pthread_cond_wait(&q->read_wait_cond, &q->read_wait_mutex);
-
-      q->sleeping_prods--;
-      pthread_mutex_unlock(&q->read_wait_mutex);
+    switch(q->locking) {
+      case MSGP_LOCK_SPIN:
+        while(q->noccupied > limit) {}
+        break;
+      case MSGP_LOCK_MUTEX:
+        pthread_mutex_lock(&q->read_wait_mutex);
+        q->sleeping_prods++;
+        while(q->noccupied > limit)
+          pthread_cond_wait(&q->read_wait_cond, &q->read_wait_mutex);
+        q->sleeping_prods--;
+        pthread_mutex_unlock(&q->read_wait_mutex);
+        break;
+      case MSGP_LOCK_YIELD:
+        while(q->noccupied > limit) {
+          if(sched_yield()) { fprintf(stderr, "msg-pool: yield failed"); abort(); }
+        }
+        break;
     }
   }
 }
@@ -136,19 +161,25 @@ static inline void _msgpool_wait_for_write(MsgPool *q)
   if(q->noccupied == 0 && q->open)
   {
     // Wait on write
-    if(q->use_spinlock) {
-      while(q->noccupied == 0 && q->open) {}
-    }
-    else {
-      // don't need to use __sync_fetch_and_add because we have write_wait_mutex
-      pthread_mutex_lock(&q->write_wait_mutex);
-      q->sleeping_cons++;
-
-      while(q->noccupied == 0 && q->open)
-        pthread_cond_wait(&q->write_wait_cond, &q->write_wait_mutex);
-
-      q->sleeping_cons--;
-      pthread_mutex_unlock(&q->write_wait_mutex);
+    switch(q->locking) {
+      case MSGP_LOCK_SPIN:
+        while(q->noccupied == 0 && q->open) {}
+        break;
+      case MSGP_LOCK_MUTEX:
+        // don't need to use __sync_fetch_and_add because we have write_wait_mutex
+        pthread_mutex_lock(&q->write_wait_mutex);
+        q->sleeping_cons++;
+        while(q->noccupied == 0 && q->open)
+          pthread_cond_wait(&q->write_wait_cond, &q->write_wait_mutex);
+        q->sleeping_cons--;
+        pthread_mutex_unlock(&q->write_wait_mutex);
+        break;
+      case MSGP_LOCK_YIELD:
+        // sched_yield returns non-zero on error
+        while(q->noccupied == 0 && q->open) {
+          if(sched_yield()) { fprintf(stderr, "msg-pool: yield failed"); abort(); }
+        }
+        break;
     }
   }
 }
@@ -182,8 +213,9 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
 
         __sync_synchronize();
 
-        if(!q->use_spinlock)
+        if(q->locking == MSGP_LOCK_MUTEX)
         {
+          // May need to notify waiting threads
           size_t nproducers = q->nproducers - q->sleeping_prods;
           if(q->sleeping_prods &&
              (nproducers < q->nel-nocc || nproducers == 0 || nocc == 0))
@@ -196,7 +228,7 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
           }
         }
 
-        return q->elsize;
+        return (int)q->elsize;
       }
     }
 
@@ -204,8 +236,6 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
     _msgpool_wait_for_write(q);
     if(q->noccupied == 0 && !q->open) return 0;
   }
-
-  return 0;
 }
 
 static inline void msgpool_write(MsgPool *q, const void *restrict p,
@@ -235,8 +265,9 @@ static inline void msgpool_write(MsgPool *q, const void *restrict p,
 
         __sync_synchronize();
 
-        if(!q->use_spinlock)
+        if(q->locking == MSGP_LOCK_MUTEX)
         {
+          // May need to notify waiting threads
           size_t nconsumers = q->nconsumers - q->sleeping_cons;
           if(q->sleeping_cons &&
              (nconsumers < nocc || nconsumers == 0 || q->noccupied == q->nel))
@@ -266,10 +297,12 @@ static inline void msgpool_wait_til_empty(MsgPool *q)
 }
 
 // Close causes msgpool_read() to return 0 if pool is empty
+// Beware: this function doesn't block until the pool is emtpy
+//         for that call msgpool_wait_til_empty(q) after calling msgpool_close(q)
 static inline void msgpool_close(MsgPool *q)
 {
   q->open = 0;
-  if(!q->use_spinlock && q->sleeping_cons) {
+  if(q->locking == MSGP_LOCK_MUTEX && q->sleeping_cons) {
     pthread_mutex_lock(&q->write_wait_mutex);
     if(q->sleeping_cons)
       pthread_cond_broadcast(&q->write_wait_cond); // wake all sleeping threads
@@ -280,5 +313,14 @@ static inline void msgpool_close(MsgPool *q)
 static inline void msgpool_reopen(MsgPool *q) {
   q->open = 1;
 }
+
+#undef MPOOL_EMPTY
+#undef MPOOL_READING
+#undef MPOOL_WRITING
+#undef MPOOL_FULL
+
+#undef MSGP_LOCK_SPIN
+#undef MSGP_LOCK_MUTEX
+#undef MSGP_LOCK_YIELD
 
 #endif /* MSG_POOL_H_ */

@@ -9,6 +9,8 @@
 #define NMESG_DEFAULT 1000000
 #define QLEN_DEFAULT 1000
 
+void print_usage() __attribute__((noreturn));
+
 void print_usage()
 {
   printf("usage: test [options]\n"
@@ -58,7 +60,9 @@ void run_threads(MsgPool *q, size_t nmesgs, size_t nproducers, size_t nconsumers
   size_t i;
   int rc;
 
-  printf("Using %s\n", q->use_spinlock ? "spinlock" : "mutexes");
+  const char *lockstr[] = {"spinlocks", "mutexes", "yield"};
+
+  printf("Using %s\n", lockstr[(int)q->locking]);
 
   printf("nproducers [-p]: %zu nconsumers [-c]: %zu "
          "messages [-n]: %zu qlen [-q]: %zu\n",
@@ -108,7 +112,7 @@ void run_threads(MsgPool *q, size_t nmesgs, size_t nproducers, size_t nconsumers
   for(i = 0; i < 100; i++)
     msgpool_write(q, &i, NULL);
 
-  size_t extra_sum = 100*(99/2.0);
+  size_t extra_sum = (size_t)(100*(99/2.0));
 
   msgpool_close(q);
   printf("waiting for consumers to finish...\n");
@@ -121,7 +125,7 @@ void run_threads(MsgPool *q, size_t nmesgs, size_t nproducers, size_t nconsumers
     sum += consumers[i].result;
   }
 
-  size_t corr_sum = nmesgs*((nmesgs-1)/2.0) + extra_sum;
+  size_t corr_sum = (size_t)(nmesgs*((nmesgs-1)/2.0) + extra_sum);
   printf("messages: %zu result: %zu [%s %zu]\n",
          nmesgs, sum, sum == corr_sum ? "PASS" : "FAIL", corr_sum);
 
@@ -147,25 +151,33 @@ int main(int argc, char **argv)
   size_t nmesgs = NMESG_DEFAULT;
 
   // use spinlock instead of mutex
-  int spinlock = 1;
+  int use_spinlock = 0, use_mutexes = 0, use_yield = 0;
 
   // Read args
   int c;
 
-  while ((c = getopt(argc, argv, "p:c:n:q:m")) >= 0)
-    if (c == 'p') nproducers = atoi(optarg);
-    else if (c == 'c') nconsumers = atoi(optarg);
-    else if (c == 'n') nmesgs = atoi(optarg);
-    else if (c == 'q') qlen = atoi(optarg);
-    else if (c == 'm') spinlock = 0;
+  while ((c = getopt(argc, argv, "p:c:n:q:smy")) >= 0)
+    if (c == 'p') nproducers = (size_t)atoi(optarg);
+    else if (c == 'c') nconsumers = (size_t)atoi(optarg);
+    else if (c == 'n') nmesgs = (size_t)atoi(optarg);
+    else if (c == 'q') qlen = (size_t)atoi(optarg);
+    else if (c == 's') use_spinlock = 1;
+    else if (c == 'm') use_mutexes = 1;
+    else if (c == 'y') use_yield = 1;
     else print_usage();
+
+  if(optind < argc) print_usage();
+  if(use_spinlock + use_mutexes + use_yield > 1) print_usage();
+  if(use_spinlock + use_mutexes + use_yield == 0) use_spinlock = 1;
 
   // Create pool of ints of length qlen
   MsgPool q;
-  if(spinlock)
+  if(use_spinlock)
     msgpool_alloc_spinlock(&q, qlen, sizeof(size_t));
-  else
+  else if(use_mutexes)
     msgpool_alloc_mutex(&q, qlen, sizeof(size_t), nproducers, nconsumers);
+  else
+    msgpool_alloc_yield(&q, qlen, sizeof(size_t));
 
   msgpool_iterate(&q, set_zero, NULL);
 
