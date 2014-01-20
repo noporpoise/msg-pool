@@ -120,10 +120,10 @@ static inline void msgpool_dealloc(MsgPool *q)
 // element (beware: not aligned in memory)
 // Can be used to initialise elements at the begining or clean up afterwards
 static inline void msgpool_iterate(MsgPool *q,
-                                   void (*func)(char *el, size_t idx, void *args),
+                                   void (*func)(void *el, size_t idx, void *args),
                                    void *args)
 {
-  size_t i; char *ptr, *data = q->data;
+  size_t i; void *ptr, *data = q->data;
   for(i = 0, ptr = data+1; i < q->nel; i++, ptr += q->qsize) {
     func(ptr, i, args);
   }

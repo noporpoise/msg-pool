@@ -57,12 +57,12 @@ threads running per CPU core.
 Release a message pool
 
     void msgpool_iterate(MsgPool *q,
-                         void (*func)(char *el, size_t idx, void *args),
+                         void (*func)(void *el, size_t idx, void *args),
                          void *args)
 
 Iterate over elements in the pool. Example:
 
-    void alloc_elements(char *ptr, size_t i, void *args)
+    void alloc_elements(void *ptr, size_t i, void *args)
     {
       (void)args; (void)i;
       char *tmp = malloc(100);

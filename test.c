@@ -138,7 +138,7 @@ void run_threads(MsgPool *q, size_t nmesgs, size_t nproducers, size_t nconsumers
   free(consumers);
 }
 
-void set_zero(char *ptr, size_t i, void *args)
+void set_zero(void *ptr, size_t i, void *args)
 {
   (void)args;
   memcpy(ptr, &i, sizeof(size_t));
