@@ -19,6 +19,8 @@
 #define MSGP_LOCK_MUTEX 1
 #define MSGP_LOCK_YIELD 2
 
+// TODO: circular buffer using compare_and_swap
+
 typedef struct
 {
   // qsize = elsize+1, qend=(qsize)*nel
@@ -208,8 +210,8 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
 
         // Order of next two operations is not important
         q->data[i] = MPOOL_EMPTY;
-        // q->noccupied--; fetch_and_sub returns old value
-        nocc = __sync_fetch_and_sub(&q->noccupied, 1) - 1;
+        // q->noccupied--;
+        nocc = __sync_sub_and_fetch(&q->noccupied, 1);
 
         __sync_synchronize();
 
@@ -260,8 +262,8 @@ static inline void msgpool_write(MsgPool *q, const void *restrict p,
         __sync_synchronize();
 
         q->data[i] = MPOOL_FULL;
-        // q->noccupied++; fetch_and_add returns old value
-        nocc = __sync_fetch_and_add(&q->noccupied, 1) + 1;
+        // q->noccupied++;
+        nocc = __sync_add_and_fetch(&q->noccupied, 1);
 
         __sync_synchronize();
 
