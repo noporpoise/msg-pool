@@ -198,7 +198,8 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
   {
     for(i = s; i < q->qend; i += q->qsize)
     {
-      if(__sync_bool_compare_and_swap((volatile char*)&q->data[i],
+      if(q->data[i] == MPOOL_FULL &&
+         __sync_bool_compare_and_swap((volatile char*)&q->data[i],
                                       MPOOL_FULL, MPOOL_READING))
       {
         q->last_read = i;
@@ -250,7 +251,8 @@ static inline void msgpool_write(MsgPool *q, const void *restrict p,
   {
     for(i = s; i < q->qend; i += q->qsize)
     {
-      if(__sync_bool_compare_and_swap((volatile char*)&q->data[i],
+      if(q->data[i] == MPOOL_EMPTY &&
+         __sync_bool_compare_and_swap((volatile char*)&q->data[i],
                                       MPOOL_EMPTY, MPOOL_WRITING))
       {
         q->last_write = i;
