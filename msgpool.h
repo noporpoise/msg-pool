@@ -186,16 +186,17 @@ static inline void _msgpool_wait_for_write(MsgPool *q)
   }
 }
 
-// Returns number of bytes read (0 or q->nel)
+// Returns index claimed or -1 if msgpool is closed
 static inline int msgpool_read(MsgPool *q, void *restrict p,
                                const void *restrict swap)
 {
   _msgpool_wait_for_write(q);
-  if(q->noccupied == 0 && !q->open) return 0;
 
-  size_t i, nocc, s = q->last_read;
+  size_t i, s = q->last_read;
   while(1)
   {
+    if(q->noccupied == 0 && !q->open) return -1;
+
     for(i = s; i < q->qend; i += q->qsize)
     {
       if(q->data[i] == MPOOL_FULL &&
@@ -206,38 +207,40 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
         memcpy(p, q->data+i+1, q->elsize);
         if(swap) memcpy(q->data+i+1, swap, q->elsize);
 
-        // memory barrier: must read element before setting MPOOL_EMPTY
+        // memory barrier: must read element before calling msgpool_release
         __sync_synchronize();
 
-        // Order of next two operations is not important
-        q->data[i] = MPOOL_EMPTY;
-        // q->noccupied--;
-        nocc = __sync_sub_and_fetch(&q->noccupied, 1);
-
-        __sync_synchronize();
-
-        if(q->locking == MSGP_LOCK_MUTEX)
-        {
-          // May need to notify waiting threads
-          size_t nproducers = q->nproducers - q->sleeping_prods;
-          if(q->sleeping_prods &&
-             (nproducers < q->nel-nocc || nproducers == 0 || nocc == 0))
-          {
-            // Notify when space appears in pool or pool empty
-            pthread_mutex_lock(&q->read_wait_mutex);
-            if(q->sleeping_prods)
-              pthread_cond_signal(&q->read_wait_cond); // wake one
-            pthread_mutex_unlock(&q->read_wait_mutex);
-          }
-        }
-
-        return (int)q->elsize;
+        return (int)i;
       }
     }
 
     s = 0;
     _msgpool_wait_for_write(q);
-    if(q->noccupied == 0 && !q->open) return 0;
+  }
+}
+
+static inline void msgpool_release(MsgPool *q, size_t idx)
+{
+  // Order of next two operations is not important
+  q->data[idx] = MPOOL_EMPTY;
+  // q->noccupied--;
+  size_t nocc = __sync_sub_and_fetch(&q->noccupied, 1);
+
+  __sync_synchronize();
+
+  if(q->locking == MSGP_LOCK_MUTEX)
+  {
+    // May need to notify waiting threads
+    size_t nproducers = q->nproducers - q->sleeping_prods;
+    if(q->sleeping_prods &&
+       (nproducers < q->nel-nocc || nproducers == 0 || nocc == 0))
+    {
+      // Notify when space appears in pool or pool empty
+      pthread_mutex_lock(&q->read_wait_mutex);
+      if(q->sleeping_prods)
+        pthread_cond_signal(&q->read_wait_cond); // wake one
+      pthread_mutex_unlock(&q->read_wait_mutex);
+    }
   }
 }
 

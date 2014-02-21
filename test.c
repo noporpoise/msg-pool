@@ -48,9 +48,10 @@ void* produce(void *ptr)
 void* consume(void *ptr)
 {
   struct TestThread *cons = (struct TestThread*)ptr;
-  size_t r, sum = 0;
+  size_t r, sum = 0; int idx;
   printf("Created consumer %zu\n", cons->id);
-  while(msgpool_read(cons->q, &r, NULL)) {
+  while((idx = msgpool_read(cons->q, &r, NULL)) != -1) {
+    msgpool_release(cons->q, idx);
     // printf("%zu\n", r);
     sum += r;
   }
