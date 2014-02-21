@@ -11,15 +11,16 @@
 #include <assert.h>
 
 #define MPOOL_EMPTY 0
-#define MPOOL_READING 1
-#define MPOOL_WRITING 2
-#define MPOOL_FULL 3
+#define MPOOL_CLAIMED 1
+#define MPOOL_FULL 2
 
 #define MSGP_LOCK_SPIN 0
 #define MSGP_LOCK_MUTEX 1
 #define MSGP_LOCK_YIELD 2
 
-// TODO: circular buffer using compare_and_swap
+// 1. Replace pthread with semaphore
+// 2. merge claim_read / claim_write (?)
+// 3. Use rand odd numbers to iterate list to avoid repeatedly clashing (?)
 
 typedef struct
 {
@@ -44,6 +45,7 @@ typedef struct
   pthread_cond_t read_wait_cond, write_wait_cond;
 } MsgPool;
 
+#define msgpool_get_ptr(pool,pos) ((void*)((pool)->data+(pos)+1))
 
 static inline void msgpool_alloc_spinlock(MsgPool *q, size_t nel, size_t elsize)
 {
@@ -187,8 +189,7 @@ static inline void _msgpool_wait_for_write(MsgPool *q)
 }
 
 // Returns index claimed or -1 if msgpool is closed
-static inline int msgpool_read(MsgPool *q, void *restrict p,
-                               const void *restrict swap)
+static inline int msgpool_claim_read(MsgPool *q)
 {
   _msgpool_wait_for_write(q);
 
@@ -201,15 +202,10 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
     {
       if(q->data[i] == MPOOL_FULL &&
          __sync_bool_compare_and_swap((volatile char*)&q->data[i],
-                                      MPOOL_FULL, MPOOL_READING))
+                                      MPOOL_FULL, MPOOL_CLAIMED))
       {
         q->last_read = i;
-        memcpy(p, q->data+i+1, q->elsize);
-        if(swap) memcpy(q->data+i+1, swap, q->elsize);
-
-        // memory barrier: must read element before calling msgpool_release
-        __sync_synchronize();
-
+        __sync_sub_and_fetch(&q->noccupied, 1); // q->noccupied--;
         return (int)i;
       }
     }
@@ -219,36 +215,11 @@ static inline int msgpool_read(MsgPool *q, void *restrict p,
   }
 }
 
-static inline void msgpool_release(MsgPool *q, size_t idx)
-{
-  // Order of next two operations is not important
-  q->data[idx] = MPOOL_EMPTY;
-  // q->noccupied--;
-  size_t nocc = __sync_sub_and_fetch(&q->noccupied, 1);
-
-  __sync_synchronize();
-
-  if(q->locking == MSGP_LOCK_MUTEX)
-  {
-    // May need to notify waiting threads
-    size_t nproducers = q->nproducers - q->sleeping_prods;
-    if(q->sleeping_prods &&
-       (nproducers < q->nel-nocc || nproducers == 0 || nocc == 0))
-    {
-      // Notify when space appears in pool or pool empty
-      pthread_mutex_lock(&q->read_wait_mutex);
-      if(q->sleeping_prods)
-        pthread_cond_signal(&q->read_wait_cond); // wake one
-      pthread_mutex_unlock(&q->read_wait_mutex);
-    }
-  }
-}
-
-static inline void msgpool_write(MsgPool *q, const void *restrict p,
-                                 void *restrict swap)
+// returns index
+static inline int msgpool_claim_write(MsgPool *q)
 {
   _msgpool_wait_for_read(q, 0);
-  size_t i, nocc, s = q->last_write;
+  size_t i, s = q->last_write;
 
   while(1)
   {
@@ -256,38 +227,10 @@ static inline void msgpool_write(MsgPool *q, const void *restrict p,
     {
       if(q->data[i] == MPOOL_EMPTY &&
          __sync_bool_compare_and_swap((volatile char*)&q->data[i],
-                                      MPOOL_EMPTY, MPOOL_WRITING))
+                                      MPOOL_EMPTY, MPOOL_CLAIMED))
       {
         q->last_write = i;
-        if(swap) memcpy(swap, q->data+i+1, q->elsize);
-        memcpy(q->data+i+1, p, q->elsize);
-
-        // memory barrier on writes: must write element before writing status
-        // dev: may not be needed on x86, this is already promised
-        __sync_synchronize();
-
-        q->data[i] = MPOOL_FULL;
-        // q->noccupied++;
-        nocc = __sync_add_and_fetch(&q->noccupied, 1);
-
-        __sync_synchronize();
-
-        if(q->locking == MSGP_LOCK_MUTEX)
-        {
-          // May need to notify waiting threads
-          size_t nconsumers = q->nconsumers - q->sleeping_cons;
-          if(q->sleeping_cons &&
-             (nconsumers < nocc || nconsumers == 0 || q->noccupied == q->nel))
-          {
-            // Notify waiting readers when element written
-            pthread_mutex_lock(&q->write_wait_mutex);
-            if(q->sleeping_cons)
-              pthread_cond_signal(&q->write_wait_cond); // wake reading thread
-            pthread_mutex_unlock(&q->write_wait_mutex);
-          }
-        }
-
-        return;
+        return (int)i;
       }
     }
 
@@ -295,6 +238,73 @@ static inline void msgpool_write(MsgPool *q, const void *restrict p,
     // Wait until there is space to write
     _msgpool_wait_for_read(q, 0);
   }
+}
+
+// new_state must be MPOOL_EMPTY or MPOOL_FULL
+static inline void msgpool_release(MsgPool *q, size_t pos, char new_state)
+{
+  assert(new_state == MPOOL_EMPTY || new_state == MPOOL_FULL);
+  assert(q->data[pos] == MPOOL_CLAIMED);
+
+  __sync_synchronize();
+  q->data[pos] = new_state;
+
+  if(new_state == MPOOL_EMPTY)
+  {
+    if(q->locking == MSGP_LOCK_MUTEX)
+    {
+      // May need to notify waiting threads
+      size_t nproducers = q->nproducers - q->sleeping_prods;
+      if(q->sleeping_prods &&
+         (nproducers < q->nel-q->noccupied || nproducers == 0 || q->noccupied == 0))
+      {
+        // Notify when space appears in pool or pool empty
+        pthread_mutex_lock(&q->read_wait_mutex);
+        if(q->sleeping_prods)
+          pthread_cond_signal(&q->read_wait_cond); // wake one
+        pthread_mutex_unlock(&q->read_wait_mutex);
+      }
+    }
+  }
+  else
+  {
+    // MPOOL_FULL
+    // q->noccupied++;
+    size_t nocc = __sync_add_and_fetch(&q->noccupied, 1);
+
+    if(q->locking == MSGP_LOCK_MUTEX)
+    {
+      // May need to notify waiting threads
+      size_t nconsumers = q->nconsumers - q->sleeping_cons;
+      if(q->sleeping_cons &&
+         (nconsumers < nocc || nconsumers == 0 || q->noccupied == q->nel))
+      {
+        // Notify waiting readers when element written
+        pthread_mutex_lock(&q->write_wait_mutex);
+        if(q->sleeping_cons)
+          pthread_cond_signal(&q->write_wait_cond); // wake reading thread
+        pthread_mutex_unlock(&q->write_wait_mutex);
+      }
+    }
+  }
+}
+
+static inline void msgpool_read(MsgPool *pool, void *restrict ptr,
+                                void *restrict swap)
+{
+  int pos = msgpool_claim_read(pool);
+  memcpy(ptr, msgpool_get_ptr(pool, pos), pool->elsize);
+  if(swap) memcpy(msgpool_get_ptr(pool, pos), swap, pool->elsize);
+  msgpool_release(pool, pos, MPOOL_EMPTY);
+}
+
+static inline void msgpool_write(MsgPool *pool, void *restrict ptr,
+                                void *restrict swap)
+{
+  int pos = msgpool_claim_write(pool);
+  if(swap) memcpy(swap, msgpool_get_ptr(pool, pos), pool->elsize);
+  memcpy(msgpool_get_ptr(pool, pos), ptr, pool->elsize);
+  msgpool_release(pool, pos, MPOOL_FULL);
 }
 
 // Wait until the pool is empty, keep msgpool_read() blocking
@@ -321,10 +331,9 @@ static inline void msgpool_reopen(MsgPool *q) {
   q->open = 1;
 }
 
-#undef MPOOL_EMPTY
-#undef MPOOL_READING
-#undef MPOOL_WRITING
-#undef MPOOL_FULL
+// #undef MPOOL_EMPTY
+// #undef MPOOL_CLAIMED
+// #undef MPOOL_FULL
 
 #undef MSGP_LOCK_SPIN
 #undef MSGP_LOCK_MUTEX

@@ -38,9 +38,11 @@ struct TestThread *producers, *consumers;
 void* produce(void *ptr)
 {
   const struct TestThread *prod = (const struct TestThread*)ptr;
+  MsgPool *pool = prod->q;
+  assert(pool->elsize == sizeof(size_t));
   size_t w;
   printf("Created producer %zu\n", prod->id);
-  for(w = prod->start; w < prod->end; w++) msgpool_write(prod->q, &w, NULL);
+  for(w = prod->start; w < prod->end; w++) msgpool_write(pool, &w, NULL);
   printf("Producer %zu finished!\n", prod->id);
   pthread_exit(NULL);
 }
@@ -48,10 +50,13 @@ void* produce(void *ptr)
 void* consume(void *ptr)
 {
   struct TestThread *cons = (struct TestThread*)ptr;
-  size_t r, sum = 0; int idx;
+  MsgPool *pool = cons->q;
+  assert(pool->elsize == sizeof(size_t));
+  size_t r, sum = 0; int pos;
   printf("Created consumer %zu\n", cons->id);
-  while((idx = msgpool_read(cons->q, &r, NULL)) != -1) {
-    msgpool_release(cons->q, idx);
+  while((pos = msgpool_claim_read(pool)) != -1) {
+    memcpy(&r, msgpool_get_ptr(pool, pos), sizeof(size_t));
+    msgpool_release(pool, pos, MPOOL_EMPTY);
     // printf("%zu\n", r);
     sum += r;
   }
