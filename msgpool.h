@@ -125,9 +125,9 @@ static inline void msgpool_iterate(MsgPool *q,
                                    void (*func)(void *el, size_t idx, void *args),
                                    void *args)
 {
-  size_t i; void *ptr, *data = q->data;
+  size_t i; char *ptr, *data = q->data;
   for(i = 0, ptr = data+1; i < q->nel; i++, ptr += q->qsize) {
-    func(ptr, i, args);
+    func((void*)ptr, i, args);
   }
 }
 
