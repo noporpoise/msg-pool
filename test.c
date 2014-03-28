@@ -18,6 +18,9 @@ void print_usage() __attribute__((noreturn));
 void print_usage()
 {
   printf("usage: test [options]\n"
+"    -s      Use spinlock\n"
+"    -y      Use yield\n"
+"    -m      Use mutexes\n"
 "    -p <p>  Number of producer threads [default: %i]\n"
 "    -c <c>  Number of consumer threads [default: %i]\n"
 "    -n <n>  Number of messages per producer [default: %i]\n"
@@ -70,7 +73,7 @@ void run_threads(MsgPool *q, size_t nmesgs, size_t nproducers, size_t nconsumers
   size_t i;
   int rc;
 
-  const char *lockstr[] = {"spinlocks", "mutexes", "yield"};
+  const char *lockstr[] = {"spinlocks [-s]", "yield [-y]", "mutexes [-m]"};
 
   printf("Using %s\n", lockstr[(int)q->locking]);
 
@@ -116,7 +119,7 @@ void run_threads(MsgPool *q, size_t nmesgs, size_t nproducers, size_t nconsumers
     if(rc != 0) { fprintf(stderr, "Join thread failed\n"); exit(-1); }
   }
 
-  // Wait for those jobs to finish before submitting more
+  // Wait until empty
   msgpool_wait_til_empty(q);
 
   for(i = 0; i < 100; i++)
@@ -124,8 +127,11 @@ void run_threads(MsgPool *q, size_t nmesgs, size_t nproducers, size_t nconsumers
 
   size_t extra_sum = (size_t)(100*(99/2.0));
 
-  msgpool_close(q);
+  sleep(1);
+
   printf("waiting for consumers to finish...\n");
+  msgpool_close(q);
+
   size_t sum = 0;
 
   // Wait until finished
@@ -185,7 +191,7 @@ int main(int argc, char **argv)
   if(use_spinlock)
     msgpool_alloc_spinlock(&q, qlen, sizeof(size_t));
   else if(use_mutexes)
-    msgpool_alloc_mutex(&q, qlen, sizeof(size_t), nproducers, nconsumers);
+    msgpool_alloc_mutex(&q, qlen, sizeof(size_t));
   else
     msgpool_alloc_yield(&q, qlen, sizeof(size_t));
 
