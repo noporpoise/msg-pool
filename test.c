@@ -68,7 +68,9 @@ void* consume(void *ptr)
   pthread_exit(NULL);
 }
 
-void run_threads(MsgPool *q, size_t nmesgs, size_t nproducers, size_t nconsumers)
+// returns true on success
+static bool run_threads(MsgPool *q, size_t nmesgs,
+                        size_t nproducers, size_t nconsumers)
 {
   size_t i;
   int rc;
@@ -148,6 +150,8 @@ void run_threads(MsgPool *q, size_t nmesgs, size_t nproducers, size_t nconsumers
   pthread_attr_destroy(&thread_attr);
   free(producers);
   free(consumers);
+
+  return sum == corr_sum;
 }
 
 void set_zero(void *ptr, size_t i, void *args)
@@ -197,10 +201,10 @@ int main(int argc, char **argv)
 
   msgpool_iterate(&q, set_zero, NULL);
 
-  run_threads(&q, nmesgs, nproducers, nconsumers);
+  bool pass = run_threads(&q, nmesgs, nproducers, nconsumers);
 
   msgpool_dealloc(&q);
 
-  printf("Done.\n");
-  return EXIT_SUCCESS;
+  printf(pass ? "Done.\n" : "Fail.\n");
+  return pass ? EXIT_SUCCESS : EXIT_FAILURE;
 }
